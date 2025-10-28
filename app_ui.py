@@ -96,6 +96,12 @@ except Exception:
 # ---------- UI ----------
 st.set_page_config(page_title="Kidney Monitor – E2E", layout="wide")
 st.title("🩺 Kidney Monitor – End-to-End Tester")
+if loaded_model_path:
+    st.caption(f"Model loaded: {os.path.basename(loaded_model_path)}")
+else:
+    tried = ", ".join([os.path.basename(p) for p in MODEL_CANDIDATES])
+    err_msg = f" Error: {model_load_error}" if model_load_error else ""
+    st.warning(f"Model not loaded. Tried: {tried}.{err_msg}")
 
 with st.sidebar:
     st.header("Session")
