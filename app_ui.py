@@ -66,14 +66,32 @@ except Exception:
 from tensorflow import keras
 import joblib
 
-MODEL_PATH = os.path.join("app", "Kidney_dialysis_datamodel.h5")
+# Prefer new `.keras` format, fall back to legacy `.h5`.
+MODEL_CANDIDATES = [
+    os.path.join("app", "Kidney_dialysis_datamodel.keras"),
+    os.path.join("app", "Kidney_dialysis_datamodel.h5"),
+]
 SCALER_PATH = os.path.join("app", "scaler.pkl")
+
 model = None
+loaded_model_path = None
+model_load_error = None
+for _path in MODEL_CANDIDATES:
+    if os.path.exists(_path):
+        try:
+            model = keras.models.load_model(_path, compile=False)
+            loaded_model_path = _path
+            break
+        except Exception as e:
+            model_load_error = e
+            # Try next candidate
+
 scaler = None
-if os.path.exists(MODEL_PATH):
-    model = keras.models.load_model(MODEL_PATH, compile=False)
-if os.path.exists(SCALER_PATH):
-    scaler = joblib.load(SCALER_PATH)
+try:
+    if os.path.exists(SCALER_PATH):
+        scaler = joblib.load(SCALER_PATH)
+except Exception:
+    scaler = None
 
 # ---------- UI ----------
 st.set_page_config(page_title="Kidney Monitor – E2E", layout="wide")
