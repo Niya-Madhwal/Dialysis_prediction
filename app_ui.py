@@ -62,22 +62,54 @@ except Exception:
     except Exception:
         pass
 
-# Optional: Load trained Keras model and scaler
+# Optional: Load trained Keras model and scaler (prefer .keras, fallback to .h5)
 from tensorflow import keras
 import joblib
 
-MODEL_PATH = os.path.join("app", "Kidney_dialysis_datamodel.h5")
+MODEL_PATH_KERAS = os.path.join("app", "Kidney_dialysis_datamodel.keras")
+MODEL_PATH_H5 = os.path.join("app", "Kidney_dialysis_datamodel.h5")
 SCALER_PATH = os.path.join("app", "scaler.pkl")
+
 model = None
 scaler = None
-if os.path.exists(MODEL_PATH):
-    model = keras.models.load_model(MODEL_PATH, compile=False)
+MODEL_LOAD_MESSAGES = []
+
+# Load model with preference for the modern .keras format
+if os.path.exists(MODEL_PATH_KERAS):
+    try:
+        model = keras.models.load_model(MODEL_PATH_KERAS, compile=False)
+    except Exception as e:
+        MODEL_LOAD_MESSAGES.append(f"Failed to load {MODEL_PATH_KERAS}: {e}")
+elif os.path.exists(MODEL_PATH_H5):
+    try:
+        # Legacy H5 format can be brittle across TF/Keras versions; prefer .keras
+        model = keras.models.load_model(MODEL_PATH_H5, compile=False)
+        MODEL_LOAD_MESSAGES.append("Loaded legacy .h5 model. Consider migrating to .keras format.")
+    except Exception as e:
+        MODEL_LOAD_MESSAGES.append(f"Failed to load {MODEL_PATH_H5}: {e}")
+else:
+    MODEL_LOAD_MESSAGES.append(
+        "No model file found. Place `app/Kidney_dialysis_datamodel.keras` (preferred) or `.h5`."
+    )
+
+# Load scaler if present
 if os.path.exists(SCALER_PATH):
-    scaler = joblib.load(SCALER_PATH)
+    try:
+        scaler = joblib.load(SCALER_PATH)
+    except Exception as e:
+        MODEL_LOAD_MESSAGES.append(f"Failed to load scaler at {SCALER_PATH}: {e}")
 
 # ---------- UI ----------
 st.set_page_config(page_title="Kidney Monitor – E2E", layout="wide")
 st.title("🩺 Kidney Monitor – End-to-End Tester")
+
+# Surface any model/scaler load messages at the top
+if MODEL_LOAD_MESSAGES:
+    for _msg in MODEL_LOAD_MESSAGES:
+        if ("Failed" in _msg) or ("No model" in _msg):
+            st.warning(_msg)
+        else:
+            st.info(_msg)
 
 with st.sidebar:
     st.header("Session")
@@ -236,7 +268,7 @@ if st.button("Run prediction"):
     if (parse_quality is not None) and (parse_quality < PARSE_QUALITY_THRESHOLD):
         st.warning("Skipping prediction due to low KFT parse quality.")
     elif model is None:
-        st.warning("No model found at `models/dialysis_model.h5`.")
+        st.warning("No model loaded. Ensure `app/Kidney_dialysis_datamodel.keras` or `.h5` is present.")
     else:
         try:
             # Scale if scaler exists
