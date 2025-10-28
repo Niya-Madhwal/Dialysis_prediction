@@ -90,7 +90,8 @@ with st.sidebar:
 st.subheader("1) Upload KFT report")
 uploaded = st.file_uploader("Upload KFT PDF/PNG/JPG", type=["pdf", "png", "jpg", "jpeg"])
 
-baseline_kft = {}
+# Parsed KFT values (may be empty)
+baseline_kft: dict = {}
 parse_quality = None
 PARSE_QUALITY_THRESHOLD = 0.6
 if uploaded:
@@ -106,12 +107,47 @@ if uploaded:
         st.error(f"KFT parsing failed: {e}")
         baseline_kft = {"Sodium": 138.0, "Potassium": 4.5}
 
-st.markdown("**Baseline labs**")
+# Manual override UI
+st.markdown("**Baseline labs (parsed) — you may edit manually below**")
 st.json(baseline_kft or {"Sodium": 138.0, "Potassium": 4.5})
 if parse_quality is not None:
     st.markdown(f"**Parse quality:** {parse_quality:.0%} • Threshold: {PARSE_QUALITY_THRESHOLD:.0%}")
     if parse_quality < PARSE_QUALITY_THRESHOLD:
-        st.warning("Parse quality below threshold. Predictions will be skipped.")
+        st.warning("Parse quality below threshold. You can enter exact values manually below.")
+
+with st.expander("Enter/adjust KFT values manually"):
+    # Prefill with parsed if available
+    def _pref(key: str, default: float) -> float:
+        try:
+            return float(baseline_kft.get(key, default))
+        except Exception:
+            return float(default)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        manual_na = st.number_input("Sodium (mEq/L)", min_value=100.0, max_value=200.0,
+                                    value=_pref("Sodium", 138.0), step=0.1)
+    with col2:
+        manual_k = st.number_input("Potassium (mEq/L)", min_value=2.0, max_value=10.0,
+                                   value=_pref("Potassium", 4.5), step=0.1)
+    with col3:
+        manual_cr = st.number_input("Creatinine (mg/dL)", min_value=0.1, max_value=25.0,
+                                     value=_pref("Creatinine", 7.2), step=0.1)
+    with col4:
+        manual_urea = st.number_input("Urea (mg/dL)", min_value=1.0, max_value=300.0,
+                                      value=_pref("Urea", 95.0), step=1.0)
+
+    use_manual_kft = st.checkbox("Use manual values for calculations", value=True)
+
+effective_kft = baseline_kft.copy() if isinstance(baseline_kft, dict) else {}
+if 'use_manual_kft' in locals() and use_manual_kft:
+    effective_kft["Sodium"] = float(manual_na)
+    effective_kft["Potassium"] = float(manual_k)
+    effective_kft["Creatinine"] = float(manual_cr)
+    effective_kft["Urea"] = float(manual_urea)
+
+st.markdown("**KFT values that will be used**")
+st.json(effective_kft or {"Sodium": 138.0, "Potassium": 4.5})
 
 # ------------------- 2) Intake logger -------------------
 st.subheader("2) Log intake items (one per line)")
@@ -157,7 +193,7 @@ if breakdown and totals:
     else:
         try:
             proj = predict_dilution_spike(
-                baseline_kft=baseline_kft or {"Sodium": 138.0, "Potassium": 4.5},
+                baseline_kft=effective_kft or {"Sodium": 138.0, "Potassium": 4.5},
                 intake_totals=totals,
                 weight_kg=float(weight_kg),
                 breakdown=breakdown,
@@ -212,9 +248,9 @@ if st.button("Run prediction"):
         "Weight": float(weight_kg),
         "Diabetes": st.sidebar.selectbox("Diabetes (0=No, 1=Yes)", options=[0,1], index=0),
         "Hypertension": st.sidebar.selectbox("Hypertension (0=No, 1=Yes)", options=[0,1], index=0),
-        "Creatinine": baseline_kft.get("Creatinine", np.nan),
-        "Urea": baseline_kft.get("Urea", np.nan),
-        "Potassium": baseline_kft.get("Potassium", np.nan),
+        "Creatinine": (effective_kft.get("Creatinine") if isinstance(effective_kft, dict) else None) or np.nan,
+        "Urea": (effective_kft.get("Urea") if isinstance(effective_kft, dict) else None) or np.nan,
+        "Potassium": (effective_kft.get("Potassium") if isinstance(effective_kft, dict) else None) or np.nan,
         "Hemoglobin": st.sidebar.number_input("Hemoglobin", value=10.0),
         "Kt/V": st.sidebar.number_input("Kt/V", value=1.2),
         "URR": st.sidebar.number_input("URR", value=70.0),
@@ -233,8 +269,12 @@ if st.button("Run prediction"):
     st.markdown("**Features sent to model:**")
     st.dataframe(X)
 
-    if (parse_quality is not None) and (parse_quality < PARSE_QUALITY_THRESHOLD):
-        st.warning("Skipping prediction due to low KFT parse quality.")
+    # Allow prediction when manual values are explicitly chosen
+    if (
+        (parse_quality is not None) and (parse_quality < PARSE_QUALITY_THRESHOLD)
+        and (not ('use_manual_kft' in locals() and use_manual_kft))
+    ):
+        st.warning("Skipping prediction due to low KFT parse quality. Enable 'Use manual values' above to proceed.")
     elif model is None:
         st.warning("No model found at `models/dialysis_model.h5`.")
     else:
@@ -255,3 +295,10 @@ if st.button("Run prediction"):
                 pass
         except Exception as e:
             st.error(f"Model inference failed: {e}")
+
+# ------------------- Disclaimer -------------------
+st.divider()
+st.caption(
+    "Disclaimer: These insights are generated by AI and are for informational purposes only. "
+    "They are not a substitute for professional medical advice, diagnosis, or treatment. Always consult your doctor."
+)
