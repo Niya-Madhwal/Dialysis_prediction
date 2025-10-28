@@ -1,10 +1,12 @@
 # app_ui.py
 
 import os
+import json
 import datetime as dt
 import pandas as pd
 import numpy as np
 import streamlit as st
+from typing import List, Dict, Any
 
 
 
@@ -23,6 +25,128 @@ APP_DIR = os.path.join(os.path.dirname(__file__), "app")
 DATA_DIR = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 HISTORY_CSV = os.path.join(DATA_DIR, "diet_history.csv")
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
+
+# ---------- History helpers (per-patient, per-date) ----------
+def _sanitize_patient_id(pid: str) -> str:
+    # Avoid path traversal; keep simple safe characters
+    pid = (pid or "").strip()
+    return "".join(c for c in pid if c.isalnum() or c in ("-", "_", ".")).strip(".-_") or "UNKNOWN"
+
+def _patient_dir(pid: str) -> str:
+    d = os.path.join(HISTORY_DIR, _sanitize_patient_id(pid))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def save_patient_day_log(patient_id: str, session_date: dt.date, session_id: str, breakdown: List[Dict[str, Any]]) -> None:
+    """Append a session breakdown under app/data/history/{patient_id}/{YYYY-MM-DD}.json"""
+    path = os.path.join(_patient_dir(patient_id), f"{session_date.isoformat()}.json")
+    day_payload: List[Dict[str, Any]] = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    day_payload = data
+        except Exception:
+            day_payload = []
+    day_payload.append({
+        "session_id": session_id,
+        "timestamp": dt.datetime.now().isoformat(),
+        "items": breakdown,
+    })
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(day_payload, f, ensure_ascii=False, indent=2)
+
+def list_patient_dates(patient_id: str) -> List[str]:
+    d = _patient_dir(patient_id)
+    try:
+        files = [fn for fn in os.listdir(d) if fn.endswith(".json")]
+    except FileNotFoundError:
+        files = []
+    dates = []
+    for fn in files:
+        name = fn[:-5]
+        try:
+            # validate format
+            _ = dt.date.fromisoformat(name)
+            dates.append(name)
+        except Exception:
+            continue
+    dates.sort(reverse=True)
+    return dates
+
+def load_breakdown_for_dates(patient_id: str, dates_iso: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    base = _patient_dir(patient_id)
+    for d_iso in dates_iso:
+        path = os.path.join(base, f"{d_iso}.json")
+        day_items: List[Dict[str, Any]] = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    sessions = json.load(f)
+                    if isinstance(sessions, list):
+                        for s in sessions:
+                            if isinstance(s, dict) and isinstance(s.get("items"), list):
+                                day_items.extend(s["items"])
+            except Exception:
+                pass
+        out[d_iso] = day_items
+    return out
+
+def _fallback_list_dates_from_csv(patient_id: str) -> List[str]:
+    if not os.path.exists(HISTORY_CSV):
+        return []
+    try:
+        df = pd.read_csv(HISTORY_CSV)
+        if df.empty:
+            return []
+        # Filter by session_id prefix if present
+        if "session_id" in df.columns:
+            mask = df["session_id"].astype(str).str.startswith(f"{patient_id}-")
+            df = df[mask]
+        if "date" in df.columns:
+            dates = sorted(df["date"].dropna().astype(str).unique().tolist(), reverse=True)
+        elif "data" in df.columns:  # legacy column name
+            dates = sorted(df["data"].dropna().astype(str).unique().tolist(), reverse=True)
+        else:
+            dates = []
+        return dates
+    except Exception:
+        return []
+
+def _fallback_load_breakdown_for_dates(patient_id: str, dates_iso: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    if not os.path.exists(HISTORY_CSV):
+        return out
+    try:
+        df = pd.read_csv(HISTORY_CSV)
+        if df.empty:
+            return out
+        if "session_id" in df.columns:
+            df = df[df["session_id"].astype(str).str.startswith(f"{patient_id}-")]
+        date_col = "date" if "date" in df.columns else ("data" if "data" in df.columns else None)
+        if date_col is None:
+            return out
+        for d_iso in dates_iso:
+            sub = df[df[date_col].astype(str) == d_iso]
+            items: List[Dict[str, Any]] = []
+            for _, row in sub.iterrows():
+                v = row.get("items_json")
+                if isinstance(v, str) and v.strip():
+                    try:
+                        parsed = json.loads(v)
+                        if isinstance(parsed, list):
+                            # items are dicts
+                            items.extend(parsed)
+                    except Exception:
+                        pass
+            out[d_iso] = items
+    except Exception:
+        return out
+    return out
 
 # ---------- Imports from your modules ----------
 # Food lookup (prefer newer)
@@ -167,8 +291,102 @@ if breakdown and totals:
         except Exception as e:
             st.error(f"Projection failed: {e}")
 
+# ------------------- 3b) Projection from saved history (last N days) -------------------
+st.subheader("3b) Project using saved history for this patient")
+available_dates = list_patient_dates(patient_id)
+if not available_dates:
+    # Try CSV fallback for legacy entries
+    available_dates = _fallback_list_dates_from_csv(patient_id)
+
+if available_dates:
+    default_n = 5
+    default_sel = available_dates[:default_n]
+    selected_dates = st.multiselect(
+        "Select dates (latest first)", options=available_dates, default=default_sel,
+        help="Last 5 dates are preselected by default"
+    )
+
+    if st.button("Compute projection from selected saved dates"):
+        try:
+            data_by_date = load_breakdown_for_dates(patient_id, selected_dates)
+            if not any(data_by_date.get(d) for d in selected_dates):
+                # Legacy fallback
+                data_by_date = _fallback_load_breakdown_for_dates(patient_id, selected_dates)
+
+            results_rows = []
+            combined_items = []
+            for d_iso in selected_dates:
+                items = data_by_date.get(d_iso, [])
+                if not items:
+                    continue
+                df_b = pd.DataFrame(items)
+                def _sum(col):
+                    return round(float(df_b[col].fillna(0).sum()), 2) if col in df_b else 0.0
+                totals_d = {
+                    "Water_ml": _sum("Water_ml"),
+                    "Sodium_mg": _sum("Sodium_mg"),
+                    "Potassium_mg": _sum("Potassium_mg"),
+                    "Phosphorus_mg": _sum("Phosphorus_mg"),
+                    "Protein_g": _sum("Protein_g"),
+                }
+                # Per-date projection
+                try:
+                    proj_d = predict_dilution_spike(
+                        baseline_kft=baseline_kft or {"Sodium": 138.0, "Potassium": 4.5},
+                        intake_totals=totals_d,
+                        weight_kg=float(weight_kg),
+                        breakdown=items,
+                        tbw_fraction=float(tbw_fraction),
+                    ) if predict_dilution_spike is not None else None
+                except Exception:
+                    proj_d = None
+
+                row = {"date": d_iso, **totals_d}
+                if proj_d:
+                    row.update({
+                        "Sodium_new": proj_d.get("Sodium_new"),
+                        "ΔSodium": proj_d.get("ΔSodium"),
+                        "Potassium_new": proj_d.get("Potassium_new"),
+                        "ΔPotassium": proj_d.get("ΔPotassium"),
+                    })
+                results_rows.append(row)
+                combined_items.extend(items)
+
+            if results_rows:
+                st.markdown("**Per-date projections**")
+                st.dataframe(pd.DataFrame(results_rows), use_container_width=True)
+
+            # Combined across all selected dates
+            if combined_items:
+                df_c = pd.DataFrame(combined_items)
+                def _sumc(col):
+                    return round(float(df_c[col].fillna(0).sum()), 2) if col in df_c else 0.0
+                totals_c = {
+                    "Water_ml": _sumc("Water_ml"),
+                    "Sodium_mg": _sumc("Sodium_mg"),
+                    "Potassium_mg": _sumc("Potassium_mg"),
+                    "Phosphorus_mg": _sumc("Phosphorus_mg"),
+                    "Protein_g": _sumc("Protein_g"),
+                }
+                try:
+                    proj_c = predict_dilution_spike(
+                        baseline_kft=baseline_kft or {"Sodium": 138.0, "Potassium": 4.5},
+                        intake_totals=totals_c,
+                        weight_kg=float(weight_kg),
+                        breakdown=combined_items,
+                        tbw_fraction=float(tbw_fraction),
+                    ) if predict_dilution_spike is not None else None
+                except Exception as e:
+                    proj_c = None
+                st.markdown("**Combined across selected dates**")
+                st.json({"totals": totals_c, "projection": proj_c or {}})
+        except Exception as e:
+            st.error(f"Failed to compute from history: {e}")
+else:
+    st.info("No saved history for this patient yet.")
+
 # ------------------- 4) Save to history CSV -------------------
-st.subheader("4) Save this intake to history CSV")
+st.subheader("4) Save this intake to history CSV + per-patient/day JSON")
 if breakdown:
     if not os.path.isfile(HISTORY_CSV):
         pd.DataFrame(columns=["session_id", "date", "items_json"]).to_csv(HISTORY_CSV, index=False)
@@ -182,14 +400,26 @@ if breakdown:
                 "items_json": pd.Series(breakdown).to_json(orient="values"),
             }
             pd.DataFrame([row]).to_csv(HISTORY_CSV, mode="a", index=False, header=False)
-            st.success(f"Saved to {HISTORY_CSV}")
+            # Also save to structured per-patient/day file
+            try:
+                save_patient_day_log(patient_id, session_date, session_id, breakdown)
+            except Exception as _e:
+                st.warning(f"Saved CSV, but JSON history failed: {_e}")
+            st.success(f"Saved to {HISTORY_CSV} and per-patient history")
         except Exception as e:
             st.error(f"Save failed: {e}")
 
-    with st.expander("Show last 5 saved sessions"):
+    with st.expander("Show last 5 saved sessions/dates"):
         try:
-            df_hist = pd.read_csv(HISTORY_CSV)
-            st.dataframe(df_hist.tail(5), use_container_width=True)
+            # Show per-patient dates first
+            dates = list_patient_dates(patient_id)
+            if not dates:
+                dates = _fallback_list_dates_from_csv(patient_id)
+            st.write("Patient dates:", ", ".join(dates[:5]) or "(none)")
+            # Then show raw CSV last rows for legacy visibility
+            if os.path.exists(HISTORY_CSV):
+                df_hist = pd.read_csv(HISTORY_CSV)
+                st.dataframe(df_hist.tail(5), use_container_width=True)
         except Exception as e:
             st.info("No history yet.")
 
