@@ -1,6 +1,7 @@
 # app_ui.py
 
 import os
+import json
 import datetime as dt
 import pandas as pd
 import numpy as np
@@ -231,7 +232,151 @@ if breakdown:
 
 # ------------------- 5) Predict severity / next date -------------------
 st.subheader("5) Predict dialysis severity / next date")
+
+# Allow selecting past intakes for this patient to include in prediction
+history_df = None
+selected_past_n = 0
+include_current_intake = False
+agg_totals = None
+agg_proj = None
+
+try:
+    if os.path.isfile(HISTORY_CSV):
+        history_df = pd.read_csv(HISTORY_CSV)
+except Exception:
+    history_df = None
+
+with st.expander("Use past saved intakes for this patient (optional)"):
+    if history_df is None or history_df.empty:
+        st.caption("No saved intakes found.")
+    else:
+        # Filter rows belonging to this patient. Our `session_id` is stored as `<patient>-<timestamp>`
+        dfp = history_df.copy()
+        if 'session_id' in dfp.columns:
+            dfp = dfp[dfp['session_id'].astype(str).str.startswith(f"{patient_id}-", na=False)]
+        else:
+            dfp = dfp.iloc[0:0]
+
+        if dfp.empty:
+            st.caption("No past intakes for this patient yet.")
+        else:
+            # Normalize a date column for display and sorting
+            date_col = 'date' if 'date' in dfp.columns else ('data' if 'data' in dfp.columns else None)
+            if date_col is not None:
+                with pd.option_context('mode.chained_assignment', None):
+                    dfp['__date'] = pd.to_datetime(dfp[date_col], errors='coerce')
+                dfp = dfp.sort_values(by='__date').reset_index(drop=True)
+            else:
+                dfp['__date'] = pd.NaT
+
+            max_n = int(min(14, len(dfp)))
+            selected_past_n = st.number_input(
+                "Include last N saved intakes (days)", min_value=0, max_value=max_n, value=0, step=1
+            )
+            if breakdown:
+                include_current_intake = st.checkbox("Include current unsaved intake as well", value=True)
+            else:
+                include_current_intake = False
+
+            # Build aggregated totals across the selected sessions + optionally current
+            if selected_past_n > 0 or include_current_intake:
+                totals_list: list[dict] = []
+
+                # Helper to compute per-session totals from various schemas
+                def compute_totals_from_row(row: pd.Series) -> dict:
+                    # Preferred: items_json saved by this UI
+                    try:
+                        if 'items_json' in row and isinstance(row['items_json'], str) and row['items_json']:
+                            items = json.loads(row['items_json'])
+                            df_items = pd.DataFrame(items)
+                            def _sum(col):
+                                return round(float(df_items[col].fillna(0).sum()), 2) if col in df_items else 0.0
+                            return {
+                                "Water_ml": _sum("Water_ml"),
+                                "Sodium_mg": _sum("Sodium_mg"),
+                                "Potassium_mg": _sum("Potassium_mg"),
+                                "Phosphorus_mg": _sum("Phosphorus_mg"),
+                                "Protein_g": _sum("Protein_g"),
+                            }
+                    except Exception:
+                        pass
+
+                    # Legacy: items string from simple_diet_logger.py
+                    try:
+                        if 'items' in row and isinstance(row['items'], str) and row['items']:
+                            raw_items = [s.strip() for s in str(row['items']).split('|') if s.strip()]
+                            if breakdown_food_items is not None and raw_items:
+                                items = breakdown_food_items(raw_items)
+                                df_items = pd.DataFrame(items)
+                                def _sum(col):
+                                    return round(float(df_items[col].fillna(0).sum()), 2) if col in df_items else 0.0
+                                return {
+                                    "Water_ml": _sum("Water_ml"),
+                                    "Sodium_mg": _sum("Sodium_mg"),
+                                    "Potassium_mg": _sum("Potassium_mg"),
+                                    "Phosphorus_mg": _sum("Phosphorus_mg"),
+                                    "Protein_g": _sum("Protein_g"),
+                                }
+                    except Exception:
+                        pass
+
+                    return {"Water_ml": 0.0, "Sodium_mg": 0.0, "Potassium_mg": 0.0, "Phosphorus_mg": 0.0, "Protein_g": 0.0}
+
+                if selected_past_n > 0:
+                    recent = dfp.tail(selected_past_n)
+                    for _, r in recent.iterrows():
+                        totals_list.append(compute_totals_from_row(r))
+
+                if include_current_intake and breakdown:
+                    # Compute totals from current breakdown already shown above
+                    df_b = pd.DataFrame(breakdown)
+                    def _sum(col):
+                        return round(float(df_b[col].fillna(0).sum()), 2) if col in df_b else 0.0
+                    totals_list.append({
+                        "Water_ml": _sum("Water_ml"),
+                        "Sodium_mg": _sum("Sodium_mg"),
+                        "Potassium_mg": _sum("Potassium_mg"),
+                        "Phosphorus_mg": _sum("Phosphorus_mg"),
+                        "Protein_g": _sum("Protein_g"),
+                    })
+
+                # Aggregate totals
+                if totals_list:
+                    agg_totals = {
+                        "Water_ml": round(sum(t.get("Water_ml", 0.0) for t in totals_list), 2),
+                        "Sodium_mg": round(sum(t.get("Sodium_mg", 0.0) for t in totals_list), 2),
+                        "Potassium_mg": round(sum(t.get("Potassium_mg", 0.0) for t in totals_list), 2),
+                        "Phosphorus_mg": round(sum(t.get("Phosphorus_mg", 0.0) for t in totals_list), 2),
+                        "Protein_g": round(sum(t.get("Protein_g", 0.0) for t in totals_list), 2),
+                    }
+                    st.markdown("**Combined intake totals (selected days)**")
+                    st.json(agg_totals)
+
+                    # Project effect on Na/K using the fluid parser
+                    if predict_dilution_spike is not None:
+                        try:
+                            agg_proj = predict_dilution_spike(
+                                baseline_kft=effective_kft or {"Sodium": 138.0, "Potassium": 4.5},
+                                intake_totals=agg_totals,
+                                weight_kg=float(weight_kg),
+                                breakdown=None,
+                                tbw_fraction=float(tbw_fraction),
+                            )
+                            st.markdown("**Projected Na/K after combined intake (~1h)**")
+                            st.json(agg_proj)
+                        except Exception as e:
+                            st.warning(f"Multi-day projection failed: {e}")
+
 if st.button("Run prediction"):
+    # Use effective KFT, optionally overridden by the aggregated projection
+    kft_for_prediction = dict(effective_kft) if isinstance(effective_kft, dict) else {"Sodium": 138.0, "Potassium": 4.5}
+    if isinstance(agg_proj, dict):
+        if "Sodium_new" in agg_proj:
+            kft_for_prediction["Sodium"] = float(agg_proj["Sodium_new"])
+        if "Potassium_new" in agg_proj:
+            kft_for_prediction["Potassium"] = float(agg_proj["Potassium_new"])
+    st.markdown("**KFT values used for prediction**")
+    st.json(kft_for_prediction)
     # These are the exact columns your model expects:
     required_features = [
         'Age', 'Gender', 'Weight', 'Diabetes', 'Hypertension', 'Creatinine', 'Urea', 'Potassium', 'Hemoglobin',
@@ -248,9 +393,9 @@ if st.button("Run prediction"):
         "Weight": float(weight_kg),
         "Diabetes": st.sidebar.selectbox("Diabetes (0=No, 1=Yes)", options=[0,1], index=0),
         "Hypertension": st.sidebar.selectbox("Hypertension (0=No, 1=Yes)", options=[0,1], index=0),
-        "Creatinine": (effective_kft.get("Creatinine") if isinstance(effective_kft, dict) else None) or np.nan,
-        "Urea": (effective_kft.get("Urea") if isinstance(effective_kft, dict) else None) or np.nan,
-        "Potassium": (effective_kft.get("Potassium") if isinstance(effective_kft, dict) else None) or np.nan,
+        "Creatinine": (kft_for_prediction.get("Creatinine") if isinstance(kft_for_prediction, dict) else None) or np.nan,
+        "Urea": (kft_for_prediction.get("Urea") if isinstance(kft_for_prediction, dict) else None) or np.nan,
+        "Potassium": (kft_for_prediction.get("Potassium") if isinstance(kft_for_prediction, dict) else None) or np.nan,
         "Hemoglobin": st.sidebar.number_input("Hemoglobin", value=10.0),
         "Kt/V": st.sidebar.number_input("Kt/V", value=1.2),
         "URR": st.sidebar.number_input("URR", value=70.0),
