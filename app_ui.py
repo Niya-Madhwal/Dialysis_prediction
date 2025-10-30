@@ -202,6 +202,10 @@ if do_lookup:
             st.markdown("**Intake totals**")
             st.json(totals)
 
+            # Persist in session_state for later saving across reruns
+            st.session_state["breakdown"] = breakdown
+            st.session_state["totals"] = totals
+
 # ------------------- 3) Fluid projection -------------------
 st.subheader("3) Fluid dilution & K spike (~1h)")
 proj = None
@@ -223,7 +227,9 @@ if breakdown and totals:
 
 # ------------------- 4) Save to history CSV -------------------
 st.subheader("4) Save this intake to history")
-if breakdown:
+# Use persisted breakdown if available (so save works after rerun)
+persisted_breakdown = st.session_state.get("breakdown", [])
+if persisted_breakdown:
     # Ensure master CSV exists (for backward compatibility)
     if not os.path.isfile(HISTORY_CSV):
         pd.DataFrame(columns=["session_id", "date", "items_json"]).to_csv(HISTORY_CSV, index=False)
@@ -235,7 +241,7 @@ if breakdown:
             session_id = f"{patient_id}-{now_ts}"
 
             # Prepare rows for master and patient-specific files
-            items_json = pd.Series(breakdown).to_json(orient="values")
+            items_json = pd.Series(persisted_breakdown).to_json(orient="values")
             master_row = {
                 "session_id": session_id,
                 "date": session_date.isoformat(),
@@ -258,36 +264,37 @@ if breakdown:
         except Exception as e:
             st.error(f"Save failed: {e}")
 
-    with st.expander("Show last saved sessions for this patient"):
-        try:
-            # Collect the patient's records across recent dates
-            safe_patient_id = str(patient_id).strip().replace("/", "_").replace("\\", "_")
-            patient_dir = os.path.join(HISTORY_DIR, safe_patient_id)
-            if not os.path.isdir(patient_dir):
-                st.info("No history yet for this patient.")
-            else:
-                # Read up to last 7 date files, newest first
-                date_files = sorted(
-                    [p for p in os.listdir(patient_dir) if p.endswith('.csv')],
-                    reverse=True
-                )[:7]
-                frames = []
-                for fname in date_files:
-                    fpath = os.path.join(patient_dir, fname)
-                    try:
-                        dfp = pd.read_csv(fpath)
-                        dfp.insert(1, "date", fname.replace('.csv', ''))
-                        frames.append(dfp)
-                    except Exception:
-                        continue
-                if frames:
-                    df_patient = pd.concat(frames, ignore_index=True)
-                    # Show last 10 sessions
-                    st.dataframe(df_patient.tail(10), use_container_width=True)
-                else:
-                    st.info("No history yet for this patient.")
-        except Exception:
+# Always show patient history viewer
+with st.expander("Show last saved sessions for this patient"):
+    try:
+        # Collect the patient's records across recent dates
+        safe_patient_id = str(patient_id).strip().replace("/", "_").replace("\\", "_")
+        patient_dir = os.path.join(HISTORY_DIR, safe_patient_id)
+        if not os.path.isdir(patient_dir):
             st.info("No history yet for this patient.")
+        else:
+            # Read up to last 7 date files, newest first
+            date_files = sorted(
+                [p for p in os.listdir(patient_dir) if p.endswith('.csv')],
+                reverse=True
+            )[:7]
+            frames = []
+            for fname in date_files:
+                fpath = os.path.join(patient_dir, fname)
+                try:
+                    dfp = pd.read_csv(fpath)
+                    dfp.insert(1, "date", fname.replace('.csv', ''))
+                    frames.append(dfp)
+                except Exception:
+                    continue
+            if frames:
+                df_patient = pd.concat(frames, ignore_index=True)
+                # Show last 10 sessions
+                st.dataframe(df_patient.tail(10), use_container_width=True)
+            else:
+                st.info("No history yet for this patient.")
+    except Exception:
+        st.info("No history yet for this patient.")
 
 # ------------------- 5) Predict severity / next date -------------------
 st.subheader("5) Predict dialysis severity / next date")
